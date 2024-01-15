@@ -1,10 +1,13 @@
 #include <stdio.h>
 #include <algorithm>
 #include <cuda.h>
+#include <cublas_v2.h>
 #include <iostream>
 #include <random>
 #include <device_launch_parameters.h>
 #include <cuda_runtime.h>
+#include <cuda_profiler_api.h>
+
 const int BLOCK_SIZE_WIDTH = 128;
 const int BLOCK_SIZE_K = 8;
 const int REGISTER_WIDTH_M = 8;
@@ -152,12 +155,6 @@ __global__ void MatrixMulV3Kernel(float* Md, float* Nd, float* Pd, int m, int n,
             for(int j=0;j<REGISTER_WIDTH_M;j++){
                 for(int k=0;k<REGISTER_WIDTH_N;k++){
                     localD[j][k] += Mdr[j] * Ndr[k];
-                    // for(int m=0;m<REGISTER_WIDTH_M;m++){
-                    //     localD[j][k] += Mdr[j][m]*Ndr[m][k]; 
-                    //     if(bx==0&&by==0&&tx==0&&ty==0&&j==0&&k==0&&i==0){
-                    //         printf("t: %d : (%d %d : %f*%f : %d %d)\n",t,j,m,Mdr[j][m],Ndr[m][k],m,j);
-                    //     }
-                    // }
                 }
             }
         }
@@ -171,7 +168,47 @@ __global__ void MatrixMulV3Kernel(float* Md, float* Nd, float* Pd, int m, int n,
     }
 }
 
+
+void testMatrixMulKernel(float* Md, float* Nd, float* Pd, int m, int n, int Width,float *hostAns){
+    // 启动核函数
+    dim3 threadsPerBlock(16, 16); // 每个线程块包含16x16个线程
+    dim3 numBlocks(m/16, n/16); // 根据矩阵大小设置线程块数量
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    cudaEventRecord(start); // 记录开始时间
+    MatrixMulKernel<<<numBlocks, threadsPerBlock>>>(Md, Nd, Pd, m, n, Width);
+    cudaEventRecord(stop); // 记录结束时间
+    cudaEventSynchronize(stop);
+    cudaMemcpy(hostAns, Pd, m * n * sizeof(float), cudaMemcpyDeviceToHost);
+
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    printf("Execution MatrixMulKernel Time: %f ms\n", milliseconds);
+    
+}
+void testMatrixMulV2Kernel(float* Md, float* Nd, float* Pd, int m, int n, int Width){
+    cudaEvent_t start1, stop1;
+    cudaEventCreate(&start1);
+    cudaEventCreate(&stop1);
+    cudaEventRecord(start1); // 记录开始时间
+    // 启动核函数
+    const int block_size_x_v2 = 16;
+    const int block_size_y_v2 = 16;
+    dim3 threadsPerBlockV2(block_size_x_v2, block_size_y_v2); // 每个线程块包含16x16个线程
+    dim3 numBlocksV2(m / block_size_x_v2, n / block_size_y_v2); // 根据矩阵大小设置线程块数量
+    MatrixMulV2Kernel<<<numBlocksV2, threadsPerBlockV2>>>(Md, Nd, Pd, m, n, Width);
+    cudaEventRecord(stop1); // 记录结束时间
+    cudaEventSynchronize(stop1);
+    float milliseconds_v2 = 0;
+    cudaEventElapsedTime(&milliseconds_v2, start1, stop1);
+    printf("Execution MatrixMulV2Kernel Time: %f ms\n", milliseconds_v2);
+
+}
 void testMatrixMulV3Kernel(float* Md, float* Nd, float* Pd, int m, int n, int Width){
+    cudaProfilerStart();
     cudaEvent_t start1, stop1;
     cudaEventCreate(&start1);
     cudaEventCreate(&stop1);
@@ -182,13 +219,44 @@ void testMatrixMulV3Kernel(float* Md, float* Nd, float* Pd, int m, int n, int Wi
     dim3 threadsPerBlockV2(block_size_x/REGISTER_WIDTH_M, block_size_y/REGISTER_WIDTH_M); // 每个线程块包含16x16个线程
     dim3 numBlocksV2(m / block_size_x, n / block_size_y); // 根据矩阵大小设置线程块数量
     MatrixMulV3Kernel<<<numBlocksV2, threadsPerBlockV2>>>(Md, Nd, Pd, m, n, Width);
+    cudaDeviceSynchronize();
     cudaEventRecord(stop1); // 记录结束时间
     cudaEventSynchronize(stop1);
     float milliseconds_v2 = 0;
     cudaEventElapsedTime(&milliseconds_v2, start1, stop1);
     printf("Execution MatrixMulV3Kernel Time: %f ms\n", milliseconds_v2);
+    cudaProfilerStop();
 }
+void testMatrixMulCublas(float* Md, float* Nd, float* Pd, int m, int n, int k) {
+    cudaProfilerStart();
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start); // 记录开始时间
 
+    // 创建并初始化 CUBLAS 库对象
+    cublasHandle_t handle;
+    cublasCreate(&handle);
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+
+    // 执行矩阵乘法: Pd = alpha * Md * Nd + beta * Pd
+    // 注意：cuBLAS 使用列主序，而 CUDA 使用行主序
+    cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &alpha, Nd, n, Md, k, &beta, Pd, n);
+
+    // 清理资源
+    cublasDestroy(handle);
+
+    cudaEventRecord(stop); // 记录结束时间
+    cudaEventSynchronize(stop);
+
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    printf("Execution MatrixMulCublas Time: %f ms\n", milliseconds);
+
+    cudaProfilerStop();
+}
 int main(int argc, char* argv[]) {
     if (argc != 4) {
         fprintf(stderr, "Usage: %s ROW COL WIDTH\n", argv[0]);
@@ -224,44 +292,11 @@ int main(int argc, char* argv[]) {
     cudaMemcpy(Md, hostMd, m * Width * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(Nd, hostNd, n * Width * sizeof(float), cudaMemcpyHostToDevice);
 
-    // 启动核函数
-    dim3 threadsPerBlock(16, 16); // 每个线程块包含16x16个线程
-    dim3 numBlocks(m/16, n/16); // 根据矩阵大小设置线程块数量
-
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-
-    cudaEventRecord(start); // 记录开始时间
-    MatrixMulKernel<<<numBlocks, threadsPerBlock>>>(Md, Nd, Pd, m, n, Width);
-    cudaEventRecord(stop); // 记录结束时间
-    cudaEventSynchronize(stop);
-    cudaMemcpy(hostAns, Pd, m * n * sizeof(float), cudaMemcpyDeviceToHost);
-
-    float milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, stop);
-    printf("Execution MatrixMulKernel Time: %f ms\n", milliseconds);
-    
-    cudaEvent_t start1, stop1;
-    cudaEventCreate(&start1);
-    cudaEventCreate(&stop1);
-    cudaEventRecord(start1); // 记录开始时间
-    // 启动核函数
-    const int block_size_x_v2 = 16;
-    const int block_size_y_v2 = 16;
-    dim3 threadsPerBlockV2(block_size_x_v2, block_size_y_v2); // 每个线程块包含16x16个线程
-    dim3 numBlocksV2(m / block_size_x_v2, n / block_size_y_v2); // 根据矩阵大小设置线程块数量
-    MatrixMulV2Kernel<<<numBlocksV2, threadsPerBlockV2>>>(Md, Nd, Pd, m, n, Width);
-    cudaEventRecord(stop1); // 记录结束时间
-    cudaEventSynchronize(stop1);
-    float milliseconds_v2 = 0;
-    cudaEventElapsedTime(&milliseconds_v2, start1, stop1);
-    printf("Execution MatrixMulV2Kernel Time: %f ms\n", milliseconds_v2);
-
-
+    testMatrixMulKernel(Md,Nd,Pd,m,n,Width,hostAns);
+    testMatrixMulV2Kernel(Md,Nd,Pd,m,n,Width);
     testMatrixMulV3Kernel(Md,Nd,Pd,m,n,Width);
     cudaMemcpy(hostPd, Pd, m * n * sizeof(float), cudaMemcpyDeviceToHost);
-
+    testMatrixMulCublas(Md,Nd,Pd,m,n,Width);
     // MatrixMulHost(hostMd,hostNd,hostAns,m,n,Width);
     // testCublas(Md,Nd,Pd,m,n,Width);
     for (int i = 0; i < m; ++i) {
@@ -285,9 +320,6 @@ int main(int argc, char* argv[]) {
     free(hostNd);
     free(hostPd);
     free(hostAns);
-
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
-
+    cudaDeviceReset();
     return 0;
 }
