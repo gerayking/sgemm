@@ -167,6 +167,135 @@ __global__ void MatrixMulV3Kernel(float* Md, float* Nd, float* Pd, int m, int n,
         }
     }
 }
+// double buffer， 添加从global memory 到 shared memory 的 预取
+__global__ void MatrixMulV4Kernel(float* Md, float* Nd, float* Pd, int m, int n, int Width) {
+
+    __shared__ float Mds[2][BLOCK_SIZE_WIDTH][BLOCK_SIZE_K]; //block level
+    __shared__ float Nds[2][BLOCK_SIZE_K][BLOCK_SIZE_WIDTH]; //block level
+
+    float Mdr[REGISTER_WIDTH_M];
+    float Ndr[REGISTER_WIDTH_M];
+
+    float localD[REGISTER_WIDTH_M][REGISTER_WIDTH_N];
+
+    #pragma unroll
+    for(int i=0;i<REGISTER_WIDTH_M;i++){
+        for(int j=0;j<REGISTER_WIDTH_N;j++){
+            localD[i][j] = 0;
+        }
+    }
+    int bx = blockIdx.x;
+    int by = blockIdx.y;
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int Row = (by * blockDim.y + ty)*BLOCK_SIZE_K;
+    int Col = (bx * blockDim.x + tx)*BLOCK_SIZE_K;
+    int write_stage = 0; // read_stage = write_stage ^ 1
+    for(int i = 0;i < Width/BLOCK_SIZE_K;i++){       
+        // load gmem to smem
+        if(i==0){
+            if(ty==0){
+                #pragma unroll
+                for(int x=0;x<REGISTER_WIDTH_M;x++){
+                    for(int y=0;y<REGISTER_WIDTH_N;y++){
+                        int dx = tx*REGISTER_WIDTH_M + x;
+                        Mds[write_stage^1][dx][y] = Md[(Row+dx)*Width+i*BLOCK_SIZE_K+y];
+                    }
+                }
+            }
+            // Mds[ty][tx] = Md[Row*Width+i*BLOCK_SIZE_K+tx];
+            if(tx==0){
+                #pragma unroll
+                for(int x=0;x<REGISTER_WIDTH_M;x++){             
+                    for(int y=0;y<REGISTER_WIDTH_N;y++){
+                        int dy = ty*REGISTER_WIDTH_M+y;
+                        // Col + y + (i*BLOCK_SIZE_K+x)*Width
+                        Nds[write_stage^1][x][dy] = Nd[Col + dy + (i*BLOCK_SIZE_K+x)*Width];
+                    }
+                }
+            }
+        }
+        // Nds[ty][tx] = Nd[Col + (i*BLOCK_SIZE_K+ty)*Width];
+        __syncthreads();
+        for(int t=0;t<REGISTER_WIDTH_M;t++){
+            int mOffset = ty  * REGISTER_WIDTH_M ;
+            int nOffset = tx  * REGISTER_WIDTH_M ;
+            // load smem from shared to register
+            #pragma unroll
+            for(int j = 0;j<REGISTER_WIDTH_M;j++){
+                Mdr[j] = Mds[write_stage^1][mOffset+j][t];
+            }
+            #pragma unroll
+            for(int j=0;j<REGISTER_WIDTH_M;j++){
+                Ndr[j] = Nds[write_stage^1][t][nOffset+j];
+            }
+            // if(bx==0&&by==0&&tx==0&&ty==0&&i==0){
+            //     // if(t==0){
+            //     // for(int i=0;i<BLOCK_SIZE_WIDTH;i++){
+            //     //     for(int j=0;j<BLOCK_SIZE_K;j++){
+            //     //         printf("%f ",Mds[i][j]);
+            //     //     }
+            //     //     printf("\n");
+            //     // }
+            //     // for(int i=0;i<BLOCK_SIZE_K;i++){
+            //     //     for(int j=0;j<BLOCK_SIZE_WIDTH;j++){
+            //     //         printf("%f ",Nds[i][j]);
+            //     //     }
+            //     //     printf("\n");
+            //     // }
+            //     // }
+            //     for(int i=0;i<8;i++){
+            //             printf("%f ",Ndr[i]);
+            //     }
+            //     printf("\n");
+            //     for(int i=0;i<REGISTER_WIDTH_N;i++){
+            //          printf("%f ",Mdr[i]);
+            //     }
+            //     printf("\n");
+            // }
+            // computer matrix multiply accmulate 8 * 8
+            #pragma unroll
+            for(int j=0;j<REGISTER_WIDTH_M;j++){
+                for(int k=0;k<REGISTER_WIDTH_N;k++){
+                    localD[j][k] += Mdr[j] * Ndr[k];
+                }
+            }
+        }
+        // cal mul
+        // __syncthreads();
+        if(i!=Width/BLOCK_SIZE_K-1){
+            // load gmem to smem
+            if(ty==0){
+                #pragma unroll
+                for(int x=0;x<REGISTER_WIDTH_M;x++){
+                    for(int y=0;y<REGISTER_WIDTH_N;y++){
+                        int dx = tx*REGISTER_WIDTH_M + x;
+                        Mds[write_stage][dx][y] = Md[(Row+dx)*Width+i*BLOCK_SIZE_K+y];
+                    }
+                }
+            }
+            // Mds[ty][tx] = Md[Row*Width+i*BLOCK_SIZE_K+tx];
+            if(tx==0){
+                #pragma unroll
+                for(int x=0;x<REGISTER_WIDTH_M;x++){             
+                    for(int y=0;y<REGISTER_WIDTH_N;y++){
+                        int dy = ty*REGISTER_WIDTH_M+y;
+                        // Col + y + (i*BLOCK_SIZE_K+x)*Width
+                        Nds[write_stage][x][dy] = Nd[Col + dy + (i*BLOCK_SIZE_K+x)*Width];
+                    }
+                }
+            }
+            write_stage ^= 1;
+            __syncthreads();
+        }
+
+    }
+    for(int j=0;j<REGISTER_WIDTH_M;j++){
+        for(int k=0;k<REGISTER_WIDTH_N;k++){
+            Pd[(j+Row)*Width+k+Col] = localD[j][k];
+        }
+    }
+}
 
 
 void testMatrixMulKernel(float* Md, float* Nd, float* Pd, int m, int n, int Width,float *hostAns){
@@ -227,12 +356,32 @@ void testMatrixMulV3Kernel(float* Md, float* Nd, float* Pd, int m, int n, int Wi
     printf("Execution MatrixMulV3Kernel Time: %f ms\n", milliseconds_v2);
     cudaProfilerStop();
 }
+void testMatrixMulV4Kernel(float* Md, float* Nd, float* Pd, int m, int n, int Width){
+    cudaProfilerStart();
+    cudaEvent_t start1, stop1;
+    cudaEventCreate(&start1);
+    cudaEventCreate(&stop1);
+    cudaEventRecord(start1); // 记录开始时间
+    // 启动核函数
+    const int block_size_x = 128;
+    const int block_size_y = 128;
+    dim3 threadsPerBlockV2(block_size_x/REGISTER_WIDTH_M, block_size_y/REGISTER_WIDTH_M); // 每个线程块包含16x16个线程
+    dim3 numBlocksV2(m / block_size_x, n / block_size_y); // 根据矩阵大小设置线程块数量
+    MatrixMulV4Kernel<<<numBlocksV2, threadsPerBlockV2>>>(Md, Nd, Pd, m, n, Width);
+    cudaDeviceSynchronize();
+    cudaEventRecord(stop1); // 记录结束时间
+    cudaEventSynchronize(stop1);
+    float milliseconds_v2 = 0;
+    cudaEventElapsedTime(&milliseconds_v2, start1, stop1);
+    printf("Execution MatrixMulV4Kernel Time: %f ms\n", milliseconds_v2);
+    cudaProfilerStop();
+}
+
 void testMatrixMulCublas(float* Md, float* Nd, float* Pd, int m, int n, int k) {
     cudaProfilerStart();
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
-    cudaEventRecord(start); // 记录开始时间
 
     // 创建并初始化 CUBLAS 库对象
     cublasHandle_t handle;
@@ -241,14 +390,15 @@ void testMatrixMulCublas(float* Md, float* Nd, float* Pd, int m, int n, int k) {
     const float alpha = 1.0f;
     const float beta = 0.0f;
 
+    cudaEventRecord(start); // 记录开始时间
     // 执行矩阵乘法: Pd = alpha * Md * Nd + beta * Pd
     // 注意：cuBLAS 使用列主序，而 CUDA 使用行主序
     cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &alpha, Nd, n, Md, k, &beta, Pd, n);
+    cudaEventRecord(stop); // 记录结束时间
 
     // 清理资源
     cublasDestroy(handle);
 
-    cudaEventRecord(stop); // 记录结束时间
     cudaEventSynchronize(stop);
 
     float milliseconds = 0;
@@ -283,10 +433,10 @@ int main(int argc, char* argv[]) {
     std::uniform_real_distribution<float> dist(0.0f, 1.0f);
     // 初始化矩阵内容（示例中简化为全 1 矩阵）
     for (int i = 0; i < m * Width; ++i) {
-        hostMd[i] = dist(gen);
+        hostMd[i] = i%Width;
     }
     for (int i = 0; i < Width * n; ++i) {
-        hostNd[i] = dist(gen);
+        hostNd[i] = i%Width;
     }
     // MatrixMulHost(hostMd, hostNd, hostAns, m, n, Width);
     cudaMemcpy(Md, hostMd, m * Width * sizeof(float), cudaMemcpyHostToDevice);
@@ -295,6 +445,8 @@ int main(int argc, char* argv[]) {
     testMatrixMulKernel(Md,Nd,Pd,m,n,Width,hostAns);
     testMatrixMulV2Kernel(Md,Nd,Pd,m,n,Width);
     testMatrixMulV3Kernel(Md,Nd,Pd,m,n,Width);
+    testMatrixMulV4Kernel(Md,Nd,Pd,m,n,Width);
+
     cudaMemcpy(hostPd, Pd, m * n * sizeof(float), cudaMemcpyDeviceToHost);
     testMatrixMulCublas(Md,Nd,Pd,m,n,Width);
     // MatrixMulHost(hostMd,hostNd,hostAns,m,n,Width);
@@ -320,6 +472,7 @@ int main(int argc, char* argv[]) {
     free(hostNd);
     free(hostPd);
     free(hostAns);
+    cudaProfilerStop();
     cudaDeviceReset();
     return 0;
 }
